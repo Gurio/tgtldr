@@ -32,13 +32,24 @@ def env(name: str, default: str | None = None, *, required: bool = False) -> str
     return value or ""
 
 
-BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
-OPENAI_API_KEY = env("OPENAI_API_KEY", required=True)
-ALLOWED_TELEGRAM_USER_IDS = {
-    int(x.strip())
-    for x in env("ALLOWED_TELEGRAM_USER_IDS", required=True).split(",")
-    if x.strip()
-}
+def parse_allowed_telegram_user_ids(raw_value: str) -> set[int]:
+    allowed_user_ids: set[int] = set()
+    for item in raw_value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            allowed_user_ids.add(int(item))
+        except ValueError:
+            logging.getLogger("tgtldr").warning(
+                "Ignoring non-numeric ALLOWED_TELEGRAM_USER_IDS entry: %s", item
+            )
+    return allowed_user_ids
+
+
+BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = env("OPENAI_API_KEY", "").strip()
+ALLOWED_TELEGRAM_USER_IDS = parse_allowed_telegram_user_ids(env("ALLOWED_TELEGRAM_USER_IDS", ""))
 TRANSCRIBE_MODEL = env("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 SUMMARY_MODEL = env("OPENAI_SUMMARY_MODEL", "gpt-5.4-mini")
 TRANSCRIPT_TTL_DAYS = int(env("TRANSCRIPT_TTL_DAYS", "7"))
@@ -56,7 +67,7 @@ SUPPORTED_VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".webm"
 }
 
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+openai_client: AsyncOpenAI | None = None
 
 
 def decode_platform_json(name: str) -> dict[str, Any]:
@@ -135,7 +146,8 @@ def resolve_webhook_secret() -> str:
         return configured_secret
 
     entropy = env("PLATFORM_PROJECT_ENTROPY", "").strip()
-    seed = f"{BOT_TOKEN}:{entropy}" if entropy else BOT_TOKEN
+    seed_parts = [part for part in (BOT_TOKEN, entropy, "tgtldr") if part]
+    seed = ":".join(seed_parts)
     return hashlib.sha256(f"tgtldr:{seed}".encode("utf-8")).hexdigest()
 
 
@@ -295,6 +307,34 @@ def create_transcript_store() -> TranscriptStore:
 transcript_store = create_transcript_store()
 
 
+def missing_runtime_config() -> list[str]:
+    missing: list[str] = []
+    if not BOT_TOKEN:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if not ALLOWED_TELEGRAM_USER_IDS:
+        missing.append("ALLOWED_TELEGRAM_USER_IDS")
+    return missing
+
+
+def ensure_runtime_config() -> None:
+    missing = missing_runtime_config()
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+
+def get_openai_client() -> AsyncOpenAI:
+    global openai_client
+
+    if openai_client is None:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("Missing required environment variable: OPENAI_API_KEY")
+        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+    return openai_client
+
+
 def init_db() -> None:
     transcript_store.init_db()
 
@@ -315,6 +355,9 @@ def load_transcript(token: str) -> str | None:
 async def lifespan(_: FastAPI):
     init_db()
     purge_expired_transcripts()
+    missing = missing_runtime_config()
+    if missing:
+        log.warning("App started with missing runtime config: %s", ", ".join(missing))
     yield
 
 
@@ -322,6 +365,8 @@ app = FastAPI(title="tgtldr", lifespan=lifespan)
 
 
 async def telegram_api(method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if not BOT_TOKEN:
+        raise RuntimeError("Missing required environment variable: TELEGRAM_BOT_TOKEN")
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     async with httpx.AsyncClient(timeout=120) as client:
         response = await client.post(url, json=payload)
@@ -447,7 +492,7 @@ def extract_audio(input_path: Path) -> Path:
 
 async def transcribe_audio(audio_path: Path) -> str:
     with audio_path.open("rb") as media_file:
-        result = await openai_client.audio.transcriptions.create(
+        result = await get_openai_client().audio.transcriptions.create(
             model=TRANSCRIBE_MODEL,
             file=media_file,
             response_format="text",
@@ -473,7 +518,7 @@ Rules:
 - If the transcript is too short, too noisy, or unclear, say so briefly.
 """.strip()
 
-    response = await openai_client.responses.create(
+    response = await get_openai_client().responses.create(
         model=SUMMARY_MODEL,
         input=f"{prompt}\n\nTranscript:\n{transcript}",
     )
@@ -481,6 +526,8 @@ Rules:
 
 
 async def process_message(message: dict[str, Any]) -> None:
+    ensure_runtime_config()
+
     media = pick_media(message)
     if not media:
         return
@@ -530,9 +577,6 @@ async def process_message(message: dict[str, Any]) -> None:
             if PUBLIC_BASE_URL:
                 lines.append("")
                 lines.append(f"Transcript: {PUBLIC_BASE_URL}/t/{token}")
-            else:
-                lines.append("")
-                lines.append("Transcript link disabled: set PUBLIC_BASE_URL.")
 
             await send_message(chat_id, "\n".join(lines), reply_to_message_id=message_id)
 
@@ -547,12 +591,14 @@ async def process_message(message: dict[str, Any]) -> None:
 
 @app.get("/")
 async def root() -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "tgtldr"})
+    missing = missing_runtime_config()
+    return JSONResponse({"ok": True, "service": "tgtldr", "configured": not missing, "missing": missing})
 
 
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
-    return JSONResponse({"ok": True})
+    missing = missing_runtime_config()
+    return JSONResponse({"ok": True, "configured": not missing, "missing": missing})
 
 
 @app.get("/t/{token}")
@@ -569,6 +615,8 @@ async def telegram_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
 ) -> JSONResponse:
+    ensure_runtime_config()
+
     if webhook_secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=404, detail="Not found")
 
