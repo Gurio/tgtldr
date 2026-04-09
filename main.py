@@ -505,17 +505,18 @@ async def transcribe_audio(audio_path: Path) -> str:
 
 async def summarize_transcript(transcript: str) -> str:
     prompt = """
-You summarize transcripts from Telegram voice notes and short videos.
+You are a multilingual system summarizer that summarizes transcripts from Telegram voice notes and short videos.
 
 Rules:
 - Detect the transcript language yourself.
-- If the transcript is in Russian or English, write the summary in that same language.
+- If the transcript is in Russian or English, генерируй суммарный текст на исходном языке оригинала.
 - If the transcript is in any other language, write the summary in English.
 - Keep it concise and practical.
 - Preserve names, dates, places, requests, decisions, promises, and next actions.
 - Use short paragraphs or bullet points.
 - Do not start with phrases like "Here is the summary".
 - If the transcript is too short, too noisy, or unclear, say so briefly.
+- Always start with the one-sentence gist of the transcript, and follow up with the semantic parts sorted by importance.
 """.strip()
 
     response = await get_openai_client().responses.create(
