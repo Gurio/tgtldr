@@ -1,9 +1,9 @@
-# Set database environment variables
-export DB_HOST="$POSTGRESQL_HOST"
-export DB_PORT="$POSTGRESQL_PORT"
-export DB_PATH="$POSTGRESQL_PATH"
-export DB_DATABASE="$DB_PATH"
-export DB_USERNAME="$POSTGRESQL_USERNAME"
-export DB_PASSWORD="$POSTGRESQL_PASSWORD"
-export DB_SCHEME="postgresql"
-export DATABASE_URL="${DB_SCHEME}://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_PATH}"
+# Surface Upsun PostgreSQL credentials in a standard DATABASE_URL.
+if [ -n "${POSTGRESQL_HOST:-}" ]; then
+  export DB_HOST="$POSTGRESQL_HOST"
+  export DB_PORT="$POSTGRESQL_PORT"
+  export DB_DATABASE="$POSTGRESQL_PATH"
+  export DB_USERNAME="$POSTGRESQL_USERNAME"
+  export DB_PASSWORD="$POSTGRESQL_PASSWORD"
+  export DATABASE_URL="postgresql://${DB_USERNAME}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_DATABASE}"
+fi

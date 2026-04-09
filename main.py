@@ -1,3 +1,7 @@
+import base64
+import binascii
+import hashlib
+import json
 import logging
 import os
 import secrets
@@ -11,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import imageio_ffmpeg
+import psycopg
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -28,15 +34,13 @@ def env(name: str, default: str | None = None, *, required: bool = False) -> str
 
 BOT_TOKEN = env("TELEGRAM_BOT_TOKEN", required=True)
 OPENAI_API_KEY = env("OPENAI_API_KEY", required=True)
-PUBLIC_BASE_URL = env("PUBLIC_BASE_URL", "").rstrip("/")
-WEBHOOK_SECRET = env("WEBHOOK_SECRET", required=True)
 ALLOWED_TELEGRAM_USER_IDS = {
     int(x.strip())
     for x in env("ALLOWED_TELEGRAM_USER_IDS", required=True).split(",")
     if x.strip()
 }
 TRANSCRIBE_MODEL = env("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
-SUMMARY_MODEL = env("OPENAI_SUMMARY_MODEL", "gpt-4.1-mini")
+SUMMARY_MODEL = env("OPENAI_SUMMARY_MODEL", "gpt-5.4-mini")
 TRANSCRIPT_TTL_DAYS = int(env("TRANSCRIPT_TTL_DAYS", "7"))
 DB_PATH = Path(env("DB_PATH", "data/tgtldr.sqlite3"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
@@ -55,61 +59,256 @@ SUPPORTED_VIDEO_EXTENSIONS = {
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 
-def init_db() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS transcripts (
-                token TEXT PRIMARY KEY,
-                transcript TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL
+def decode_platform_json(name: str) -> dict[str, Any]:
+    raw_value = os.getenv(name, "")
+    if not raw_value:
+        return {}
+
+    try:
+        decoded = base64.b64decode(raw_value).decode("utf-8")
+        value = json.loads(decoded)
+    except (ValueError, binascii.Error, json.JSONDecodeError):
+        log.warning("Failed to decode %s", name)
+        return {}
+
+    return value if isinstance(value, dict) else {}
+
+
+def normalize_database_url(url: str) -> str:
+    if url.startswith("pgsql://"):
+        return "postgresql://" + url.removeprefix("pgsql://")
+    return url
+
+
+def detect_database_url() -> str:
+    if database_url := env("DATABASE_URL", "").strip():
+        return normalize_database_url(database_url)
+
+    host = env("POSTGRESQL_HOST", "").strip()
+    if not host:
+        return ""
+
+    port = env("POSTGRESQL_PORT", "5432").strip()
+    database = env("POSTGRESQL_PATH", "").strip()
+    username = env("POSTGRESQL_USERNAME", "").strip()
+    password = env("POSTGRESQL_PASSWORD", "").strip()
+
+    if not all((database, username, password)):
+        return ""
+
+    return f"postgresql://{username}:{password}@{host}:{port}/{database}"
+
+
+def detect_public_base_url() -> str:
+    if public_base_url := env("PUBLIC_BASE_URL", "").rstrip("/"):
+        return public_base_url
+
+    routes = decode_platform_json("PLATFORM_ROUTES")
+    app_name = env("PLATFORM_APPLICATION_NAME", "").strip()
+    matches: list[tuple[str, dict[str, Any]]] = []
+
+    for route_url, route_config in routes.items():
+        if not isinstance(route_config, dict):
+            continue
+        if route_config.get("type") != "upstream":
+            continue
+        if app_name and route_config.get("upstream") != app_name:
+            continue
+        matches.append((route_url.rstrip("/"), route_config))
+
+    if matches:
+        matches.sort(
+            key=lambda item: (
+                not bool(item[1].get("primary")),
+                item[0].startswith("http://"),
+                item[0],
             )
-            """
         )
-        conn.commit()
+        return matches[0][0]
+
+    port = env("PORT", "").strip() or "8000"
+    return f"http://localhost:{port}"
+
+
+def resolve_webhook_secret() -> str:
+    if configured_secret := env("WEBHOOK_SECRET", "").strip():
+        return configured_secret
+
+    entropy = env("PLATFORM_PROJECT_ENTROPY", "").strip()
+    seed = f"{BOT_TOKEN}:{entropy}" if entropy else BOT_TOKEN
+    return hashlib.sha256(f"tgtldr:{seed}".encode("utf-8")).hexdigest()
+
+
+PUBLIC_BASE_URL = detect_public_base_url()
+WEBHOOK_SECRET = resolve_webhook_secret()
+DATABASE_URL = detect_database_url()
+
+
+class TranscriptStore:
+    def init_db(self) -> None:
+        raise NotImplementedError
+
+    def purge_expired_transcripts(self) -> None:
+        raise NotImplementedError
+
+    def save_transcript(self, transcript: str) -> str:
+        raise NotImplementedError
+
+    def load_transcript(self, token: str) -> str | None:
+        raise NotImplementedError
+
+
+class SQLiteTranscriptStore(TranscriptStore):
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+
+    def init_db(self) -> None:
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS transcripts (
+                    token TEXT PRIMARY KEY,
+                    transcript TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL
+                )
+                """
+            )
+            conn.commit()
+
+    def purge_expired_transcripts(self) -> None:
+        now = int(time.time())
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM transcripts WHERE expires_at < ?", (now,))
+            conn.commit()
+
+    def save_transcript(self, transcript: str) -> str:
+        token = secrets.token_urlsafe(18)
+        now = int(time.time())
+        expires_at = now + TRANSCRIPT_TTL_DAYS * 24 * 60 * 60
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "INSERT INTO transcripts (token, transcript, created_at, expires_at) VALUES (?, ?, ?, ?)",
+                (token, transcript, now, expires_at),
+            )
+            conn.commit()
+        return token
+
+    def load_transcript(self, token: str) -> str | None:
+        now = int(time.time())
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT transcript, expires_at FROM transcripts WHERE token = ?",
+                (token,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        transcript, expires_at = row
+        if expires_at < now:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM transcripts WHERE token = ?", (token,))
+                conn.commit()
+            return None
+
+        return transcript
+
+
+class PostgresTranscriptStore(TranscriptStore):
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+
+    def init_db(self) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS transcripts (
+                        token TEXT PRIMARY KEY,
+                        transcript TEXT NOT NULL,
+                        created_at BIGINT NOT NULL,
+                        expires_at BIGINT NOT NULL
+                    )
+                    """
+                )
+            conn.commit()
+
+    def purge_expired_transcripts(self) -> None:
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM transcripts WHERE expires_at < %s",
+                    (int(time.time()),),
+                )
+            conn.commit()
+
+    def save_transcript(self, transcript: str) -> str:
+        token = secrets.token_urlsafe(18)
+        now = int(time.time())
+        expires_at = now + TRANSCRIPT_TTL_DAYS * 24 * 60 * 60
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO transcripts (token, transcript, created_at, expires_at)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (token, transcript, now, expires_at),
+                )
+            conn.commit()
+        return token
+
+    def load_transcript(self, token: str) -> str | None:
+        now = int(time.time())
+        with psycopg.connect(self.database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT transcript, expires_at FROM transcripts WHERE token = %s",
+                    (token,),
+                )
+                row = cur.fetchone()
+
+            if not row:
+                return None
+
+            transcript, expires_at = row
+            if expires_at < now:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM transcripts WHERE token = %s", (token,))
+                conn.commit()
+                return None
+
+        return transcript
+
+
+def create_transcript_store() -> TranscriptStore:
+    if DATABASE_URL:
+        log.info("Using PostgreSQL transcript store")
+        return PostgresTranscriptStore(DATABASE_URL)
+
+    log.info("Using SQLite transcript store at %s", DB_PATH)
+    return SQLiteTranscriptStore(DB_PATH)
+
+
+transcript_store = create_transcript_store()
+
+
+def init_db() -> None:
+    transcript_store.init_db()
 
 
 def purge_expired_transcripts() -> None:
-    now = int(time.time())
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM transcripts WHERE expires_at < ?", (now,))
-        conn.commit()
+    transcript_store.purge_expired_transcripts()
 
 
 def save_transcript(transcript: str) -> str:
-    token = secrets.token_urlsafe(18)
-    now = int(time.time())
-    expires_at = now + TRANSCRIPT_TTL_DAYS * 24 * 60 * 60
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO transcripts (token, transcript, created_at, expires_at) VALUES (?, ?, ?, ?)",
-            (token, transcript, now, expires_at),
-        )
-        conn.commit()
-    return token
+    return transcript_store.save_transcript(transcript)
 
 
 def load_transcript(token: str) -> str | None:
-    now = int(time.time())
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT transcript, expires_at FROM transcripts WHERE token = ?",
-            (token,),
-        ).fetchone()
-
-    if not row:
-        return None
-
-    transcript, expires_at = row
-    if expires_at < now:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("DELETE FROM transcripts WHERE token = ?", (token,))
-            conn.commit()
-        return None
-
-    return transcript
+    return transcript_store.load_transcript(token)
 
 
 @asynccontextmanager
@@ -223,12 +422,10 @@ def pick_media(message: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def extract_audio(input_path: Path) -> Path:
-    if not shutil.which("ffmpeg"):
-        raise RuntimeError("ffmpeg is required for video/video_note support but was not found on PATH.")
-
     output_path = input_path.with_suffix(".mp3")
+    ffmpeg_path = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
     command = [
-        "ffmpeg",
+        ffmpeg_path,
         "-y",
         "-i",
         str(input_path),

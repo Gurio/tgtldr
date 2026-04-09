@@ -7,7 +7,7 @@ applications:
 
     # The runtime the application uses.
     # Complete list of available runtimes: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#types
-    type: "python:3.11"
+    type: "python:3.12"
 
     # Choose which container profile (ratio CPU+RAM) your app will use. Default value comes from the image itself.
     # More information: https://docs.upsun.com/manage-resources/adjust-resources.html#adjust-a-container-profile
@@ -37,7 +37,7 @@ applications:
       commands:
         # The command to launch your app. If it terminates, it’s restarted immediately.
         # You can use the $PORT or the $SOCKET environment variable depending on the socket family of your upstream
-        start: "echo 'Put your web server command in here! You need to listen to \"$UNIX\" unix socket. Read more about it here: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#web-commands'; sleep 60"
+        start: "uv run uvicorn main:app --uds $SOCKET"
       # You can listen to a UNIX socket (unix) or a TCP port (tcp, default).
       # Whether your app should speak to the webserver via TCP or Unix socket. Defaults to tcp
       # More information: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#where-to-listen
@@ -66,10 +66,9 @@ applications:
     # access:
 
     # Variables to control the environment. More information: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#variables
-    # variables:
-    #   env:
-    #     # Add environment variables here that are static.
-    #     PYTHONUNBUFFERED: "1"
+    variables:
+      env:
+        PYTHONUNBUFFERED: "1"
 
     # Outbound firewall rules for the application. More information: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#firewall
     # firewall:
@@ -83,9 +82,9 @@ applications:
     # are available in the PATH during the build process and in the runtime environment. They’re installed before
     # the build hook runs using a package manager for the language.
     # More information: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#dependencies
-    # dependencies:
-    #   python3: # Specify one Python 3 package per line.
-    #     numpy: '*'
+    dependencies:
+      python3:
+        uv: "*"
 
     # Hooks allow you to customize your code/environment as the project moves through the build and deploy stages
     # More information: https://docs.upsun.com/create-apps/app-reference/single-runtime-image.html#hooks
@@ -94,15 +93,13 @@ applications:
       # More information: https://docs.upsun.com/create-apps/hooks/hooks-comparison.html#build-hook
       build: |
         set -eux
-        
-        # Add build steps here.
-        # echo 'I am a build step'
+        uv sync --locked --no-dev
         
       # The deploy hook is run after the app container has been started, but before it has started accepting requests.
       # More information: https://docs.upsun.com/create-apps/hooks/hooks-comparison.html#deploy-hook
       deploy: |
         set -eux
-        # echo 'Put your deploy command here'
+        uv run python -c "from main import init_db, purge_expired_transcripts; init_db(); purge_expired_transcripts()"
         
 
       # The post_deploy hook is run after the app container has been started and after it has started accepting requests.
