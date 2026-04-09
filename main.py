@@ -525,20 +525,34 @@ Rules:
     return response.output_text.strip()
 
 
+async def send_usage_message(chat_id: int, message_id: int) -> None:
+    await send_message(
+        chat_id,
+        "Send me a voice note, audio file, video note, or short video and I will transcribe and summarize it.",
+        reply_to_message_id=message_id,
+    )
+
+
 async def process_message(message: dict[str, Any]) -> None:
     ensure_runtime_config()
-
-    media = pick_media(message)
-    if not media:
-        return
 
     sender = message.get("from") or {}
     sender_id = sender.get("id")
     chat_id = message["chat"]["id"]
     message_id = message["message_id"]
+    text = (message.get("text") or "").strip()
 
     if sender_id not in ALLOWED_TELEGRAM_USER_IDS:
         log.info("Ignoring message from sender_id=%s", sender_id)
+        return
+
+    if text in {"/start", "/help"}:
+        await send_usage_message(chat_id, message_id)
+        return
+
+    media = pick_media(message)
+    if not media:
+        await send_usage_message(chat_id, message_id)
         return
 
     if media["file_size"] and media["file_size"] > TELEGRAM_DOWNLOAD_LIMIT_BYTES:
@@ -621,6 +635,7 @@ async def telegram_webhook(
         raise HTTPException(status_code=404, detail="Not found")
 
     update = await request.json()
+    log.info("Received Telegram update keys=%s", ",".join(sorted(update.keys())))
     message = update.get("message")
     if message:
         background_tasks.add_task(process_message, message)
